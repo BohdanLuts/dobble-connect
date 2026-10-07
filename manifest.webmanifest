@@ -1,0 +1,20 @@
+{
+  "name": "Dobble Connect Live Match Finder",
+  "short_name": "Dobble Connect",
+  "description": "Offline live shared-symbol finder for two physical Dobble Connect cards.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#050505",
+  "theme_color": "#050505",
+  "icons": [
+    {
+      "src": "./assets/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
