@@ -1,4 +1,4 @@
-const CACHE_NAME = "dobble-connect-v2";
+const CACHE_NAME = "dobble-connect-v3";
 const APP_SHELL = [
   "./",
   "./index.html",
