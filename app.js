@@ -6,8 +6,7 @@ const APP_CONFIG = Object.freeze({
   MATCH_HOLD_MS: 700,
   TRACK_DISTANCE_RATIO: 0.085,
   BOX_SMOOTHING: 0.56,
-  CARD_REPLACEMENT_HISTOGRAM_SIMILARITY: 0.58,
-  CAMERA_START_TIMEOUT_MS: 10000
+  CARD_REPLACEMENT_HISTOGRAM_SIMILARITY: 0.58
 });
 
 const video = document.querySelector("#camera");
@@ -23,127 +22,39 @@ const tracker = new MatchTracker(APP_CONFIG);
 let stream = null;
 let analysisTimer = 0;
 let processing = false;
-let cameraState = "idle";
 let lastResult = null;
 let lastAnalysisStarted = 0;
 let analysesInWindow = 0;
 let analysisRate = 0;
 
-function withTimeout(promise, ms, message) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = window.setTimeout(() => reject(new Error(message)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => window.clearTimeout(timer));
-}
-
-async function requestCamera() {
-  try {
-    return await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: { facingMode: { ideal: "environment" } }
-    });
-  } catch (error) {
-    if (!["OverconstrainedError", "NotFoundError", "TypeError"].includes(error?.name)) throw error;
-    return navigator.mediaDevices.getUserMedia({ audio: false, video: true });
-  }
-}
-
-async function waitForVideoReady() {
-  if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0) return;
-  await new Promise((resolve, reject) => {
-    const started = performance.now();
-    const check = () => {
-      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0) return resolve();
-      if (performance.now() - started >= APP_CONFIG.CAMERA_START_TIMEOUT_MS) return reject(new Error("Camera stream did not become ready in time."));
-      window.setTimeout(check, 80);
-    };
-    check();
-  });
-}
-
-async function startCamera() {
-  if (cameraState === "starting" || cameraState === "running") return;
-  clearError();
+function attachCamera(mediaStream) {
+  stream = mediaStream || video.srcObject;
+  if (!stream) return;
+  errorPanel.hidden = true;
   retryButton.hidden = true;
-  cameraState = "starting";
-  setStatus("Requesting camera…", "starting");
-
-  if (!window.isSecureContext) {
-    cameraState = "error";
-    showError("Camera requires a secure HTTPS connection.", true);
-    return;
-  }
-  if (!navigator.mediaDevices?.getUserMedia) {
-    cameraState = "error";
-    showError("This browser does not provide camera access. Open this HTTPS site in Safari.", true);
-    return;
-  }
-
-  try {
-    stopCamera(false);
-    setStatus("Waiting for permission…", "starting");
-    stream = await withTimeout(requestCamera(), APP_CONFIG.CAMERA_START_TIMEOUT_MS, "Camera permission request timed out.");
-    if (!stream?.getVideoTracks().length) throw new Error("No video track was returned.");
-
-    video.autoplay = true;
-    video.muted = true;
-    video.playsInline = true;
-    video.setAttribute("playsinline", "");
-    video.srcObject = stream;
-    setStatus("Starting video…", "starting");
-    await withTimeout(video.play(), APP_CONFIG.CAMERA_START_TIMEOUT_MS, "Video playback did not start in time.");
-    await waitForVideoReady();
-
-    await tuneCamera(stream.getVideoTracks()[0]);
-    resizeOverlay();
-    tracker.clear();
-    cameraState = "running";
-    setStatus("Searching…", "searching");
-    scheduleAnalysis(80);
-  } catch (error) {
-    cameraState = "error";
-    const name = error?.name || "CameraError";
-    let message;
-    if (name === "NotAllowedError" || name === "SecurityError") {
-      message = "Camera access was denied. Allow Camera for this website in Safari, then tap Start camera again.";
-    } else if (name === "NotFoundError") {
-      message = "No camera was found on this device.";
-    } else if (name === "NotReadableError" || name === "AbortError") {
-      message = "The camera is busy or unavailable. Close other camera apps and try again.";
-    } else {
-      message = `${error?.message || "The camera could not be started."} (${name})`;
-    }
-    showError(message, true);
-  }
+  resizeOverlay();
+  tracker.clear();
+  setStatus("Searching…", "searching");
+  scheduleAnalysis(80);
 }
 
-function stopCamera(resetState = true) {
+function stopCamera() {
   window.clearTimeout(analysisTimer);
   analysisTimer = 0;
   if (stream) {
     for (const track of stream.getTracks()) track.stop();
     stream = null;
   }
+  if (video.srcObject) {
+    for (const track of video.srcObject.getTracks()) track.stop();
+  }
   video.pause();
   video.srcObject = null;
-  if (resetState) cameraState = "idle";
-}
-
-async function tuneCamera(track) {
-  try {
-    const capabilities = track.getCapabilities?.();
-    if (capabilities?.focusMode?.includes("continuous")) {
-      await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
-    }
-  } catch {
-    // Optional enhancement; unsupported on some iOS versions.
-  }
 }
 
 function scheduleAnalysis(delay = APP_CONFIG.ANALYSIS_INTERVAL_MS) {
   window.clearTimeout(analysisTimer);
-  if (!stream || cameraState !== "running" || document.hidden) return;
+  if (!stream || document.hidden) return;
   analysisTimer = window.setTimeout(runAnalysis, delay);
 }
 
@@ -192,6 +103,7 @@ function updateStatus(result) {
 }
 
 function setStatus(text, state) {
+  status.hidden = false;
   if (status.textContent !== text) status.textContent = text;
   status.dataset.state = state;
 }
@@ -203,10 +115,7 @@ function resizeOverlay() {
   const targetWidth = Math.round(width * pixelRatio);
   const targetHeight = Math.round(height * pixelRatio);
   const resized = overlay.width !== targetWidth || overlay.height !== targetHeight;
-  if (resized) {
-    overlay.width = targetWidth;
-    overlay.height = targetHeight;
-  }
+  if (resized) { overlay.width = targetWidth; overlay.height = targetHeight; }
   overlayContext.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
   if (resized) tracker.clear();
   drawOverlay();
@@ -254,21 +163,16 @@ function analysisPointToDisplay(point, frame) {
 function drawDebug(result) {
   const drawPolygon = (quad, color, width = 2) => {
     const points = quad.map((point) => analysisPointToDisplay(point, result.frame));
-    overlayContext.beginPath();
-    overlayContext.moveTo(points[0].x, points[0].y);
+    overlayContext.beginPath(); overlayContext.moveTo(points[0].x, points[0].y);
     for (let i = 1; i < points.length; i += 1) overlayContext.lineTo(points[i].x, points[i].y);
-    overlayContext.closePath();
-    overlayContext.strokeStyle = color;
-    overlayContext.lineWidth = width;
-    overlayContext.stroke();
+    overlayContext.closePath(); overlayContext.strokeStyle = color; overlayContext.lineWidth = width; overlayContext.stroke();
   };
   for (const candidate of result.candidates) drawPolygon(candidate.quad, "rgba(255, 210, 0, .55)", 1);
   for (const card of result.cards) {
     drawPolygon(card.quad, "#21e6ff", 2);
     if (!card.transform) continue;
     for (const symbol of card.symbols || []) {
-      const box = symbol.box;
-      const size = vision.config.CARD_NORMAL_SIZE;
+      const box = symbol.box; const size = vision.config.CARD_NORMAL_SIZE;
       drawPolygon([
         geometry.projectPoint(card.transform, box.x / size, box.y / size),
         geometry.projectPoint(card.transform, (box.x + box.width) / size, box.y / size),
@@ -278,33 +182,11 @@ function drawDebug(result) {
     }
   }
   const debug = result.debug;
-  const lines = [
-    `${debug.processingMs.toFixed(0)} ms · ${analysisRate.toFixed(1)} Hz`,
-    `candidates ${debug.candidateCount} · cards ${debug.cardCount}`,
-    `symbols ${debug.symbolCounts.join(" / ") || "—"}`,
-    `best ${debug.bestScore.toFixed(3)} · second ${debug.secondScore.toFixed(3)} · margin ${debug.margin.toFixed(3)}`
-  ];
-  overlayContext.font = "12px ui-monospace, monospace";
-  overlayContext.textBaseline = "top";
+  const lines = [`${debug.processingMs.toFixed(0)} ms · ${analysisRate.toFixed(1)} Hz`, `candidates ${debug.candidateCount} · cards ${debug.cardCount}`, `symbols ${debug.symbolCounts.join(" / ") || "—"}`, `best ${debug.bestScore.toFixed(3)} · second ${debug.secondScore.toFixed(3)} · margin ${debug.margin.toFixed(3)}`];
+  overlayContext.font = "12px ui-monospace, monospace"; overlayContext.textBaseline = "top";
   const panelWidth = Math.max(...lines.map((line) => overlayContext.measureText(line).width)) + 16;
-  overlayContext.fillStyle = "rgba(0, 0, 0, .72)";
-  overlayContext.fillRect(8, overlay.clientHeight - 76, panelWidth, 68);
-  overlayContext.fillStyle = "#fff";
-  lines.forEach((line, index) => overlayContext.fillText(line, 16, overlay.clientHeight - 70 + index * 15));
-}
-
-function showError(message, retryable) {
-  stopCamera(false);
-  status.hidden = true;
-  errorMessage.textContent = message;
-  errorPanel.hidden = false;
-  retryButton.hidden = !retryable;
-}
-
-function clearError() {
-  status.hidden = false;
-  errorPanel.hidden = true;
-  errorMessage.textContent = "";
+  overlayContext.fillStyle = "rgba(0, 0, 0, .72)"; overlayContext.fillRect(8, overlay.clientHeight - 76, panelWidth, 68);
+  overlayContext.fillStyle = "#fff"; lines.forEach((line, index) => overlayContext.fillText(line, 16, overlay.clientHeight - 70 + index * 15));
 }
 
 class MatchTracker {
@@ -316,28 +198,17 @@ class MatchTracker {
     if (reliableCards) this.previousCards = result.cards.map(cardSnapshot);
     const unmatchedTracks = new Set(this.tracks);
     for (const match of result.matches) {
-      let closest = null;
-      let closestDistance = Infinity;
-      for (const track of unmatchedTracks) {
-        const distance = matchDistance(track, match, result.frame);
-        if (distance < closestDistance) { closest = track; closestDistance = distance; }
-      }
+      let closest = null; let closestDistance = Infinity;
+      for (const track of unmatchedTracks) { const distance = matchDistance(track, match, result.frame); if (distance < closestDistance) { closest = track; closestDistance = distance; } }
       if (closest && closestDistance <= this.config.TRACK_DISTANCE_RATIO) {
         const direct = quadCenterDistance(closest.aQuad, match.aQuad) + quadCenterDistance(closest.bQuad, match.bQuad);
         const swapped = quadCenterDistance(closest.aQuad, match.bQuad) + quadCenterDistance(closest.bQuad, match.aQuad);
-        const alignedA = swapped < direct ? match.bQuad : match.aQuad;
-        const alignedB = swapped < direct ? match.aQuad : match.bQuad;
-        closest.aQuad = smoothQuad(closest.aQuad, alignedA, this.config.BOX_SMOOTHING);
-        closest.bQuad = smoothQuad(closest.bQuad, alignedB, this.config.BOX_SMOOTHING);
-        closest.frame = result.frame;
-        closest.score = match.score;
-        closest.hits += 1;
-        closest.lastSeen = now;
+        const alignedA = swapped < direct ? match.bQuad : match.aQuad; const alignedB = swapped < direct ? match.aQuad : match.bQuad;
+        closest.aQuad = smoothQuad(closest.aQuad, alignedA, this.config.BOX_SMOOTHING); closest.bQuad = smoothQuad(closest.bQuad, alignedB, this.config.BOX_SMOOTHING);
+        closest.frame = result.frame; closest.score = match.score; closest.hits += 1; closest.lastSeen = now;
         if (closest.hits >= this.config.MATCH_CONFIRMATIONS) closest.confirmed = true;
         unmatchedTracks.delete(closest);
-      } else {
-        this.tracks.push({ aQuad: match.aQuad, bQuad: match.bQuad, frame: result.frame, score: match.score, hits: 1, confirmed: this.config.MATCH_CONFIRMATIONS <= 1, lastSeen: now });
-      }
+      } else this.tracks.push({ aQuad: match.aQuad, bQuad: match.bQuad, frame: result.frame, score: match.score, hits: 1, confirmed: this.config.MATCH_CONFIRMATIONS <= 1, lastSeen: now });
     }
     for (const track of unmatchedTracks) if (!track.confirmed) track.hits = Math.max(0, track.hits - 1);
     this.tracks = this.tracks.filter((track) => now - track.lastSeen <= this.config.MATCH_HOLD_MS && (track.confirmed || track.hits > 0));
@@ -353,12 +224,9 @@ function matchDistance(track, match, frame) {
 }
 function quadCenterDistance(a, b) {
   const center = (quad) => quad.reduce((sum, point) => ({ x: sum.x + point.x / 4, y: sum.y + point.y / 4 }), { x: 0, y: 0 });
-  const ca = center(a); const cb = center(b);
-  return Math.hypot(ca.x - cb.x, ca.y - cb.y);
+  const ca = center(a); const cb = center(b); return Math.hypot(ca.x - cb.x, ca.y - cb.y);
 }
-function smoothQuad(previous, current, currentWeight) {
-  return previous.map((point, index) => ({ x: point.x * (1 - currentWeight) + current[index].x * currentWeight, y: point.y * (1 - currentWeight) + current[index].y * currentWeight }));
-}
+function smoothQuad(previous, current, currentWeight) { return previous.map((point, index) => ({ x: point.x * (1 - currentWeight) + current[index].x * currentWeight, y: point.y * (1 - currentWeight) + current[index].y * currentWeight })); }
 function cardSnapshot(card) {
   const histogram = new Float32Array(12);
   for (const symbol of card.symbols || []) for (let i = 0; i < histogram.length; i += 1) histogram[i] += symbol.histogram[i];
@@ -367,51 +235,30 @@ function cardSnapshot(card) {
   return { box: card.box, histogram };
 }
 function cardsWereReplaced(previous, currentCards, frame) {
-  const current = currentCards.map(cardSnapshot);
-  const diagonal = Math.hypot(frame.width, frame.height);
+  const current = currentCards.map(cardSnapshot); const diagonal = Math.hypot(frame.width, frame.height);
   const directPosition = boxCenterDistance(previous[0].box, current[0].box) + boxCenterDistance(previous[1].box, current[1].box);
   const swappedPosition = boxCenterDistance(previous[0].box, current[1].box) + boxCenterDistance(previous[1].box, current[0].box);
-  const swapped = swappedPosition < directPosition;
-  const aligned = swapped ? [current[1], current[0]] : current;
-  const positionChange = Math.min(directPosition, swappedPosition) / (2 * diagonal);
-  if (positionChange > 0.2) return true;
-  const similarityA = histogramIntersection(previous[0].histogram, aligned[0].histogram);
-  const similarityB = histogramIntersection(previous[1].histogram, aligned[1].histogram);
+  const swapped = swappedPosition < directPosition; const aligned = swapped ? [current[1], current[0]] : current;
+  const positionChange = Math.min(directPosition, swappedPosition) / (2 * diagonal); if (positionChange > 0.2) return true;
+  const similarityA = histogramIntersection(previous[0].histogram, aligned[0].histogram); const similarityB = histogramIntersection(previous[1].histogram, aligned[1].histogram);
   return similarityA < APP_CONFIG.CARD_REPLACEMENT_HISTOGRAM_SIMILARITY && similarityB < APP_CONFIG.CARD_REPLACEMENT_HISTOGRAM_SIMILARITY;
 }
-function histogramIntersection(a, b) {
-  let similarity = 0;
-  for (let i = 0; i < a.length; i += 1) similarity += Math.min(a[i], b[i]);
-  return similarity;
-}
-function boxCenterDistance(a, b) {
-  return Math.hypot((a.x + a.width / 2) - (b.x + b.width / 2), (a.y + a.height / 2) - (b.y + b.height / 2));
-}
+function histogramIntersection(a, b) { let similarity = 0; for (let i = 0; i < a.length; i += 1) similarity += Math.min(a[i], b[i]); return similarity; }
+function boxCenterDistance(a, b) { return Math.hypot((a.x + a.width / 2) - (b.x + b.width / 2), (a.y + a.height / 2) - (b.y + b.height / 2)); }
 
-retryButton.addEventListener("click", startCamera);
+window.addEventListener("dobble-camera-ready", (event) => attachCamera(event.detail));
 window.addEventListener("resize", resizeOverlay, { passive: true });
 window.addEventListener("orientationchange", () => window.setTimeout(resizeOverlay, 180), { passive: true });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) window.clearTimeout(analysisTimer);
-  else if (stream && cameraState === "running") { resizeOverlay(); scheduleAnalysis(100); }
+  else if (stream) { resizeOverlay(); scheduleAnalysis(100); }
 });
-window.addEventListener("pagehide", () => stopCamera());
-window.addEventListener("pageshow", (event) => {
-  if (event.persisted && !stream) {
-    cameraState = "idle";
-    retryButton.hidden = false;
-    setStatus("Ready", "idle");
-  }
-});
-window.addEventListener("error", (event) => { if (DEBUG) console.error("App error", event.error || event.message); });
-window.addEventListener("unhandledrejection", (event) => { if (DEBUG) console.error("Unhandled rejection", event.reason); });
+window.addEventListener("pagehide", stopCamera);
+if (video.srcObject?.active) attachCamera(video.srcObject);
+resizeOverlay();
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js", { updateViaCache: "none" }).then((registration) => registration.update()).catch(() => {}));
 }
-
-resizeOverlay();
-setStatus("Tap Start camera", "idle");
-retryButton.hidden = false;
 
 if (DEBUG) window.__DOBBLE_DEBUG__ = { vision, tracker, geometry };
