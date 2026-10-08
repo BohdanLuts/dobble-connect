@@ -6,7 +6,8 @@ const APP_CONFIG = Object.freeze({
   MATCH_HOLD_MS: 700,
   TRACK_DISTANCE_RATIO: 0.085,
   BOX_SMOOTHING: 0.56,
-  CARD_REPLACEMENT_HISTOGRAM_SIMILARITY: 0.58
+  CARD_REPLACEMENT_HISTOGRAM_SIMILARITY: 0.58,
+  CAMERA_START_TIMEOUT_MS: 10000
 });
 
 const video = document.querySelector("#camera");
@@ -22,55 +23,111 @@ const tracker = new MatchTracker(APP_CONFIG);
 let stream = null;
 let analysisTimer = 0;
 let processing = false;
+let cameraState = "idle";
 let lastResult = null;
 let lastAnalysisStarted = 0;
 let analysesInWindow = 0;
 let analysisRate = 0;
 
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => window.clearTimeout(timer));
+}
+
+async function requestCamera() {
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: "environment" } }
+    });
+  } catch (error) {
+    if (!["OverconstrainedError", "NotFoundError", "TypeError"].includes(error?.name)) throw error;
+    return navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+  }
+}
+
+async function waitForVideoReady() {
+  if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0) return;
+  await new Promise((resolve, reject) => {
+    const started = performance.now();
+    const check = () => {
+      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0) return resolve();
+      if (performance.now() - started >= APP_CONFIG.CAMERA_START_TIMEOUT_MS) return reject(new Error("Camera stream did not become ready in time."));
+      window.setTimeout(check, 80);
+    };
+    check();
+  });
+}
+
 async function startCamera() {
+  if (cameraState === "starting" || cameraState === "running") return;
   clearError();
   retryButton.hidden = true;
-  setStatus("Starting camera…", "starting");
+  cameraState = "starting";
+  setStatus("Requesting camera…", "starting");
 
+  if (!window.isSecureContext) {
+    cameraState = "error";
+    showError("Camera requires a secure HTTPS connection.", true);
+    return;
+  }
   if (!navigator.mediaDevices?.getUserMedia) {
-    showError("This browser does not provide camera access. Open the HTTPS site in Safari or Chrome.", false);
+    cameraState = "error";
+    showError("This browser does not provide camera access. Open this HTTPS site in Safari.", true);
     return;
   }
 
   try {
-    stopCamera();
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        facingMode: { ideal: "environment" },
-        width: { ideal: 1920 },
-        height: { ideal: 1080 }
-      }
-    });
+    stopCamera(false);
+    setStatus("Waiting for permission…", "starting");
+    stream = await withTimeout(requestCamera(), APP_CONFIG.CAMERA_START_TIMEOUT_MS, "Camera permission request timed out.");
+    if (!stream?.getVideoTracks().length) throw new Error("No video track was returned.");
+
+    video.autoplay = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.setAttribute("playsinline", "");
     video.srcObject = stream;
-    await video.play();
+    setStatus("Starting video…", "starting");
+    await withTimeout(video.play(), APP_CONFIG.CAMERA_START_TIMEOUT_MS, "Video playback did not start in time.");
+    await waitForVideoReady();
+
     await tuneCamera(stream.getVideoTracks()[0]);
     resizeOverlay();
     tracker.clear();
+    cameraState = "running";
     setStatus("Searching…", "searching");
     scheduleAnalysis(80);
   } catch (error) {
-    const permissionDenied = error?.name === "NotAllowedError" || error?.name === "SecurityError";
-    const message = permissionDenied
-      ? "Camera permission was denied. Allow camera access in the browser settings, then try again."
-      : "The rear camera could not be started. Close other camera apps and try again.";
+    cameraState = "error";
+    const name = error?.name || "CameraError";
+    let message;
+    if (name === "NotAllowedError" || name === "SecurityError") {
+      message = "Camera access was denied. Allow Camera for this website in Safari, then tap Start camera again.";
+    } else if (name === "NotFoundError") {
+      message = "No camera was found on this device.";
+    } else if (name === "NotReadableError" || name === "AbortError") {
+      message = "The camera is busy or unavailable. Close other camera apps and try again.";
+    } else {
+      message = `${error?.message || "The camera could not be started."} (${name})`;
+    }
     showError(message, true);
   }
 }
 
-function stopCamera() {
+function stopCamera(resetState = true) {
   window.clearTimeout(analysisTimer);
   analysisTimer = 0;
   if (stream) {
     for (const track of stream.getTracks()) track.stop();
     stream = null;
   }
+  video.pause();
   video.srcObject = null;
+  if (resetState) cameraState = "idle";
 }
 
 async function tuneCamera(track) {
@@ -80,24 +137,23 @@ async function tuneCamera(track) {
       await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
     }
   } catch {
-    // Continuous autofocus is an optional enhancement and is not standardized on iOS.
+    // Optional enhancement; unsupported on some iOS versions.
   }
 }
 
 function scheduleAnalysis(delay = APP_CONFIG.ANALYSIS_INTERVAL_MS) {
   window.clearTimeout(analysisTimer);
-  if (!stream || document.hidden) return;
+  if (!stream || cameraState !== "running" || document.hidden) return;
   analysisTimer = window.setTimeout(runAnalysis, delay);
 }
 
 function runAnalysis() {
-  if (processing || !stream || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+  if (processing || !stream || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth || !video.videoHeight) {
     scheduleAnalysis(80);
     return;
   }
   processing = true;
   const startedAt = performance.now();
-
   try {
     const result = vision.analyze(video, overlay.clientWidth, overlay.clientHeight);
     if (result) {
@@ -130,13 +186,9 @@ function updateAnalysisRate() {
 }
 
 function updateStatus(result) {
-  if (tracker.visible(performance.now()).length) {
-    setStatus("Match", "match");
-  } else if (result.cards.length < 2) {
-    setStatus("Searching…", "searching");
-  } else {
-    setStatus("Analyzing…", "analyzing");
-  }
+  if (tracker.visible(performance.now()).length) setStatus("Match", "match");
+  else if (result.cards.length < 2) setStatus("Searching…", "searching");
+  else setStatus("Analyzing…", "analyzing");
 }
 
 function setStatus(text, state) {
@@ -165,13 +217,10 @@ function drawOverlay() {
   const height = overlay.clientHeight;
   overlayContext.clearRect(0, 0, width, height);
   if (!lastResult) return;
-
-  const visibleMatches = tracker.visible(performance.now());
-  for (const match of visibleMatches) {
+  for (const match of tracker.visible(performance.now())) {
     drawMatchQuad(match.aQuad, match.frame);
     drawMatchQuad(match.bQuad, match.frame);
   }
-
   if (DEBUG) drawDebug(lastResult);
 }
 
@@ -192,8 +241,6 @@ function drawMatchQuad(quad, frame) {
 }
 
 function analysisPointToDisplay(point, frame) {
-  // analysis -> native camera -> CSS object-fit:cover. Keeping both stages explicit
-  // avoids assuming camera pixels and CSS pixels share dimensions or cropping.
   const videoX = frame.sourceRect.x + point.x * frame.sourceRect.width / frame.width;
   const videoY = frame.sourceRect.y + point.y * frame.sourceRect.height / frame.height;
   const cssWidth = overlay.clientWidth;
@@ -215,7 +262,6 @@ function drawDebug(result) {
     overlayContext.lineWidth = width;
     overlayContext.stroke();
   };
-
   for (const candidate of result.candidates) drawPolygon(candidate.quad, "rgba(255, 210, 0, .55)", 1);
   for (const card of result.cards) {
     drawPolygon(card.quad, "#21e6ff", 2);
@@ -231,7 +277,6 @@ function drawDebug(result) {
       ], "rgba(45, 255, 105, .72)", 1);
     }
   }
-
   const debug = result.debug;
   const lines = [
     `${debug.processingMs.toFixed(0)} ms · ${analysisRate.toFixed(1)} Hz`,
@@ -249,7 +294,7 @@ function drawDebug(result) {
 }
 
 function showError(message, retryable) {
-  stopCamera();
+  stopCamera(false);
   status.hidden = true;
   errorMessage.textContent = message;
   errorPanel.hidden = false;
@@ -263,24 +308,12 @@ function clearError() {
 }
 
 class MatchTracker {
-  constructor(config) {
-    this.config = config;
-    this.tracks = [];
-    this.previousCards = null;
-  }
-
-  clear() {
-    this.tracks = [];
-    this.previousCards = null;
-  }
-
+  constructor(config) { this.config = config; this.tracks = []; this.previousCards = null; }
+  clear() { this.tracks = []; this.previousCards = null; }
   update(result, now) {
     const reliableCards = result.cards.length === 2 && result.cards.every((card) => card.plausible);
-    if (reliableCards && this.previousCards && cardsWereReplaced(this.previousCards, result.cards, result.frame)) {
-      this.tracks = [];
-    }
+    if (reliableCards && this.previousCards && cardsWereReplaced(this.previousCards, result.cards, result.frame)) this.tracks = [];
     if (reliableCards) this.previousCards = result.cards.map(cardSnapshot);
-
     const unmatchedTracks = new Set(this.tracks);
     for (const match of result.matches) {
       let closest = null;
@@ -289,7 +322,6 @@ class MatchTracker {
         const distance = matchDistance(track, match, result.frame);
         if (distance < closestDistance) { closest = track; closestDistance = distance; }
       }
-
       if (closest && closestDistance <= this.config.TRACK_DISTANCE_RATIO) {
         const direct = quadCenterDistance(closest.aQuad, match.aQuad) + quadCenterDistance(closest.bQuad, match.bQuad);
         const swapped = quadCenterDistance(closest.aQuad, match.bQuad) + quadCenterDistance(closest.bQuad, match.aQuad);
@@ -304,27 +336,13 @@ class MatchTracker {
         if (closest.hits >= this.config.MATCH_CONFIRMATIONS) closest.confirmed = true;
         unmatchedTracks.delete(closest);
       } else {
-        this.tracks.push({
-          aQuad: match.aQuad,
-          bQuad: match.bQuad,
-          frame: result.frame,
-          score: match.score,
-          hits: 1,
-          confirmed: this.config.MATCH_CONFIRMATIONS <= 1,
-          lastSeen: now
-        });
+        this.tracks.push({ aQuad: match.aQuad, bQuad: match.bQuad, frame: result.frame, score: match.score, hits: 1, confirmed: this.config.MATCH_CONFIRMATIONS <= 1, lastSeen: now });
       }
     }
-
-    for (const track of unmatchedTracks) {
-      if (!track.confirmed) track.hits = Math.max(0, track.hits - 1);
-    }
+    for (const track of unmatchedTracks) if (!track.confirmed) track.hits = Math.max(0, track.hits - 1);
     this.tracks = this.tracks.filter((track) => now - track.lastSeen <= this.config.MATCH_HOLD_MS && (track.confirmed || track.hits > 0));
   }
-
-  visible(now) {
-    return this.tracks.filter((track) => track.confirmed && now - track.lastSeen <= this.config.MATCH_HOLD_MS);
-  }
+  visible(now) { return this.tracks.filter((track) => track.confirmed && now - track.lastSeen <= this.config.MATCH_HOLD_MS); }
 }
 
 function matchDistance(track, match, frame) {
@@ -333,31 +351,21 @@ function matchDistance(track, match, frame) {
   const swapped = quadCenterDistance(track.aQuad, match.bQuad) + quadCenterDistance(track.bQuad, match.aQuad);
   return Math.min(direct, swapped) / (2 * diagonal);
 }
-
 function quadCenterDistance(a, b) {
   const center = (quad) => quad.reduce((sum, point) => ({ x: sum.x + point.x / 4, y: sum.y + point.y / 4 }), { x: 0, y: 0 });
-  const ca = center(a);
-  const cb = center(b);
+  const ca = center(a); const cb = center(b);
   return Math.hypot(ca.x - cb.x, ca.y - cb.y);
 }
-
 function smoothQuad(previous, current, currentWeight) {
-  return previous.map((point, index) => ({
-    x: point.x * (1 - currentWeight) + current[index].x * currentWeight,
-    y: point.y * (1 - currentWeight) + current[index].y * currentWeight
-  }));
+  return previous.map((point, index) => ({ x: point.x * (1 - currentWeight) + current[index].x * currentWeight, y: point.y * (1 - currentWeight) + current[index].y * currentWeight }));
 }
-
 function cardSnapshot(card) {
   const histogram = new Float32Array(12);
-  for (const symbol of card.symbols || []) {
-    for (let i = 0; i < histogram.length; i += 1) histogram[i] += symbol.histogram[i];
-  }
+  for (const symbol of card.symbols || []) for (let i = 0; i < histogram.length; i += 1) histogram[i] += symbol.histogram[i];
   const total = histogram.reduce((sum, value) => sum + value, 0) || 1;
   for (let i = 0; i < histogram.length; i += 1) histogram[i] /= total;
   return { box: card.box, histogram };
 }
-
 function cardsWereReplaced(previous, currentCards, frame) {
   const current = currentCards.map(cardSnapshot);
   const diagonal = Math.hypot(frame.width, frame.height);
@@ -367,18 +375,15 @@ function cardsWereReplaced(previous, currentCards, frame) {
   const aligned = swapped ? [current[1], current[0]] : current;
   const positionChange = Math.min(directPosition, swappedPosition) / (2 * diagonal);
   if (positionChange > 0.2) return true;
-
   const similarityA = histogramIntersection(previous[0].histogram, aligned[0].histogram);
   const similarityB = histogramIntersection(previous[1].histogram, aligned[1].histogram);
   return similarityA < APP_CONFIG.CARD_REPLACEMENT_HISTOGRAM_SIMILARITY && similarityB < APP_CONFIG.CARD_REPLACEMENT_HISTOGRAM_SIMILARITY;
 }
-
 function histogramIntersection(a, b) {
   let similarity = 0;
   for (let i = 0; i < a.length; i += 1) similarity += Math.min(a[i], b[i]);
   return similarity;
 }
-
 function boxCenterDistance(a, b) {
   return Math.hypot((a.x + a.width / 2) - (b.x + b.width / 2), (a.y + a.height / 2) - (b.y + b.height / 2));
 }
@@ -387,23 +392,26 @@ retryButton.addEventListener("click", startCamera);
 window.addEventListener("resize", resizeOverlay, { passive: true });
 window.addEventListener("orientationchange", () => window.setTimeout(resizeOverlay, 180), { passive: true });
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) {
-    window.clearTimeout(analysisTimer);
-  } else if (stream) {
-    resizeOverlay();
-    scheduleAnalysis(100);
+  if (document.hidden) window.clearTimeout(analysisTimer);
+  else if (stream && cameraState === "running") { resizeOverlay(); scheduleAnalysis(100); }
+});
+window.addEventListener("pagehide", () => stopCamera());
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted && !stream) {
+    cameraState = "idle";
+    retryButton.hidden = false;
+    setStatus("Ready", "idle");
   }
 });
-window.addEventListener("pagehide", stopCamera);
-window.addEventListener("pageshow", (event) => {
-  if (event.persisted && !stream) startCamera();
-});
+window.addEventListener("error", (event) => { if (DEBUG) console.error("App error", event.error || event.message); });
+window.addEventListener("unhandledrejection", (event) => { if (DEBUG) console.error("Unhandled rejection", event.reason); });
 
 if ("serviceWorker" in navigator) {
-  window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js").catch(() => {}));
+  window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js", { updateViaCache: "none" }).then((registration) => registration.update()).catch(() => {}));
 }
 
-startCamera();
+resizeOverlay();
+setStatus("Tap Start camera", "idle");
+retryButton.hidden = false;
 
-// Kept intentionally small, but useful for deterministic fixture tests in a browser console.
 if (DEBUG) window.__DOBBLE_DEBUG__ = { vision, tracker, geometry };
